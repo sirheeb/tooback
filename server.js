@@ -35,8 +35,22 @@ try {
 }
 
 // Configuration
-const REQUIRED_DEPOSIT = parseFloat(process.env.REQUIRED_DEPOSIT || '0.01'); // BESC
-const PAYOUT_AMOUNT = parseFloat(process.env.PAYOUT_AMOUNT || '0.001'); // BESC
+const TIERS = {
+  bronze: {
+    deposit: parseFloat(process.env.BRONZE_DEPOSIT || '0.01'),
+    payout: parseFloat(process.env.BRONZE_PAYOUT || '0.001')
+  },
+  silver: {
+    deposit: parseFloat(process.env.SILVER_DEPOSIT || '0.05'),
+    payout: parseFloat(process.env.SILVER_PAYOUT || '0.005')
+  },
+  gold: {
+    deposit: parseFloat(process.env.GOLD_DEPOSIT || '0.10'),
+    payout: parseFloat(process.env.GOLD_PAYOUT || '0.01')
+  }
+};
+const REQUIRED_DEPOSIT = parseFloat(process.env.REQUIRED_DEPOSIT || '0.01'); // BESC fallback
+const PAYOUT_AMOUNT = parseFloat(process.env.PAYOUT_AMOUNT || '0.001'); // BESC fallback
 const SESSION_EXPIRE_TIME = 10 * 60 * 1000; // 10 minutes
 
 // Deposit Destination Address (fallback to treasury wallet)
@@ -130,9 +144,9 @@ app.get('/balance', async (req, res) => {
 // ============================================================================
 
 // Step 1: Request access - User submits their wallet address
-app.post('/request-access', (req, res) => {
+app.post('/request-access', async (req, res) => {
   try {
-    const { walletAddress } = req.body;
+    const { walletAddress, wagerTier = 'bronze', gameMode = 'standard' } = req.body;
 
     if (!walletAddress) {
       return res.status(400).json({ error: 'walletAddress is required' });
@@ -145,21 +159,73 @@ app.post('/request-access', (req, res) => {
 
     const normalizedAddress = walletAddress.toLowerCase();
 
-    // Check if user already has an active session
+    // Get tier configuration
+    const tier = TIERS[wagerTier.toLowerCase()] ? wagerTier.toLowerCase() : 'bronze';
+    const mode = ['standard', 'knife'].includes(gameMode.toLowerCase()) ? gameMode.toLowerCase() : 'standard';
+
+    const requiredDeposit = TIERS[tier].deposit;
+    const payoutAmount = TIERS[tier].payout;
+
+    // Check if user already has an active or pending session
     for (const [id, session] of sessions.entries()) {
-      if (session.walletAddress === normalizedAddress &&
-          (session.status === 'confirmed' || session.status === 'playing')) {
-        return res.json({
-          sessionId: id,
-          status: session.status,
-          message: 'You already have an active session',
-          credits: session.credits
-        });
+      if (session.walletAddress === normalizedAddress) {
+        if (session.status === 'confirmed' || session.status === 'playing') {
+          // If the requested tier matches the active session's tier, we keep the session active
+          if (session.wagerTier === tier) {
+            // Update game mode if changed
+            if (session.gameMode !== mode) {
+              session.gameMode = mode;
+              console.log(`[Session] Updated game mode for session ${id} to ${mode}`);
+            }
+            return res.json({
+              sessionId: id,
+              status: session.status,
+              message: 'You already have an active session',
+              credits: session.credits,
+              wagerTier: session.wagerTier,
+              gameMode: session.gameMode
+            });
+          } else {
+            // Requested a different tier: delete old active session to create a new one
+            console.log(`[Session] User requested a different tier (${tier} vs active ${session.wagerTier}) for ${normalizedAddress}. Creating new session...`);
+            sessions.delete(id);
+          }
+        } else if (session.status === 'pending') {
+          // If pending session parameter changed, delete and recreate
+          if (session.wagerTier !== tier || session.gameMode !== mode) {
+            console.log(`[Session] User changed pending parameters (${tier}/${mode} vs ${session.wagerTier}/${session.gameMode}) for ${normalizedAddress}. Recreating session...`);
+            sessions.delete(id);
+          } else {
+            // Same parameters: return existing pending session details so they can pay
+            return res.json({
+              sessionId: id,
+              depositAddress: DEPOSIT_ADDRESS,
+              requiredAmount: session.requiredDeposit,
+              status: session.status,
+              credits: session.credits,
+              whitelisted: false,
+              wagerTier: session.wagerTier,
+              gameMode: session.gameMode,
+              expiresIn: Math.max(0, Math.floor((session.expiresAt - Date.now()) / 1000))
+            });
+          }
+        }
       }
     }
 
     // Check if wallet is whitelisted
     const whitelisted = isWhitelisted(normalizedAddress);
+
+    // Get current block number to start tracking from
+    let startBlockNum = 0;
+    if (!whitelisted) {
+      try {
+        const currentBlock = await web3.eth.getBlockNumber();
+        startBlockNum = Number(currentBlock);
+      } catch (blockErr) {
+        console.error('[Session] Failed to fetch current block number on request-access:', blockErr.message);
+      }
+    }
 
     // Create new session
     const sessionId = uuidv4();
@@ -170,6 +236,12 @@ app.post('/request-access', (req, res) => {
       credits: whitelisted ? 1 : 0,
       depositTxHash: whitelisted ? 'WHITELISTED' : null,
       totalWon: 0,
+      wagerTier: tier,
+      gameMode: mode,
+      requiredDeposit: requiredDeposit,
+      payoutAmount: payoutAmount,
+      createdBlock: startBlockNum,
+      lastCheckedBlock: startBlockNum > 0 ? startBlockNum - 5 : 0,
       createdAt: Date.now(),
       expiresAt: Date.now() + SESSION_EXPIRE_TIME
     };
@@ -177,18 +249,20 @@ app.post('/request-access', (req, res) => {
     sessions.set(sessionId, session);
 
     if (whitelisted) {
-      console.log(`[Session] ✅ Created WHITELISTED session ${sessionId} for ${normalizedAddress}`);
+      console.log(`[Session] ✅ Created WHITELISTED session ${sessionId} for ${normalizedAddress} (Tier: ${tier}, Mode: ${mode})`);
     } else {
-      console.log(`[Session] Created session ${sessionId} for ${normalizedAddress}`);
+      console.log(`[Session] Created session ${sessionId} for ${normalizedAddress} (Tier: ${tier}, Mode: ${mode})`);
     }
 
     res.json({
       sessionId,
       depositAddress: DEPOSIT_ADDRESS,
-      requiredAmount: REQUIRED_DEPOSIT,
+      requiredAmount: requiredDeposit,
       status: session.status,
       credits: session.credits,
       whitelisted: whitelisted,
+      wagerTier: tier,
+      gameMode: mode,
       expiresIn: SESSION_EXPIRE_TIME / 1000 // seconds
     });
   } catch (err) {
@@ -213,13 +287,15 @@ app.get('/check-access/:sessionId', async (req, res) => {
         status: session.status,
         credits: session.credits,
         walletAddress: session.walletAddress,
-        depositTxHash: session.depositTxHash
+        depositTxHash: session.depositTxHash,
+        wagerTier: session.wagerTier,
+        gameMode: session.gameMode
       });
     }
 
     // If still pending, check blockchain for deposit
     if (session.status === 'pending') {
-      const depositFound = await checkForDeposit(session.walletAddress);
+      const depositFound = await checkForDeposit(session);
 
       if (depositFound.found) {
         // Update session
@@ -227,13 +303,15 @@ app.get('/check-access/:sessionId', async (req, res) => {
         session.credits = 1;
         session.depositTxHash = depositFound.txHash;
 
-        console.log(`[Deposit] ✅ Confirmed for ${session.walletAddress} - TX: ${depositFound.txHash}`);
+        console.log(`[Deposit] ✅ Confirmed for ${session.walletAddress} - TX: ${depositFound.txHash} (Amount: ${depositFound.amount} BESC)`);
 
         return res.json({
           status: 'confirmed',
           credits: 1,
           walletAddress: session.walletAddress,
-          depositTxHash: depositFound.txHash
+          depositTxHash: depositFound.txHash,
+          wagerTier: session.wagerTier,
+          gameMode: session.gameMode
         });
       }
     }
@@ -251,28 +329,40 @@ app.get('/check-access/:sessionId', async (req, res) => {
 });
 
 // Helper function to check blockchain for deposit
-async function checkForDeposit(fromAddress) {
+async function checkForDeposit(session) {
   try {
     const currentBlock = await web3.eth.getBlockNumber();
-    const checkBlocks = 1000; // Check last ~50 minutes (with 3s block time)
+    const currentBlockNum = Number(currentBlock);
+
+    // If we don't have block indexes initialized on this session, do a fallback
+    const fromBlock = session.lastCheckedBlock ? session.lastCheckedBlock + 1 : (session.createdBlock || currentBlockNum) - 5;
+
+    // If there are no new blocks, return early without querying RPC
+    if (fromBlock > currentBlockNum) {
+      return { found: false };
+    }
+
+    // Capping block scans per check to prevent timeouts on first load or server restart
+    const maxBlocksToCheck = 30; // ~90 seconds of history
+    const actualFromBlock = Math.max(fromBlock, currentBlockNum - maxBlocksToCheck);
+
+    console.log(`[Check Deposit] Scanning blocks ${actualFromBlock} to ${currentBlockNum} (${currentBlockNum - actualFromBlock + 1} blocks) for wallet ${session.walletAddress}...`);
 
     // Search recent blocks for transaction from user to treasury
-    for (let i = 0; i < checkBlocks; i++) {
-      const blockNumber = currentBlock - BigInt(i);
-
+    for (let blockNum = actualFromBlock; blockNum <= currentBlockNum; blockNum++) {
       try {
-        const block = await web3.eth.getBlock(blockNumber, true);
+        const block = await web3.eth.getBlock(blockNum, true);
 
         if (block && block.transactions) {
           for (const tx of block.transactions) {
             if (tx.from && tx.to &&
-                tx.from.toLowerCase() === fromAddress.toLowerCase() &&
+                tx.from.toLowerCase() === session.walletAddress.toLowerCase() &&
                 tx.to.toLowerCase() === DEPOSIT_ADDRESS) {
 
               const amountBesc = parseFloat(weiToBesc(tx.value));
 
               // Check if amount is sufficient (allow ±5% tolerance)
-              if (amountBesc >= REQUIRED_DEPOSIT * 0.95) {
+              if (amountBesc >= session.requiredDeposit * 0.95) {
                 return { found: true, txHash: tx.hash, amount: amountBesc };
               }
             }
@@ -284,6 +374,8 @@ async function checkForDeposit(fromAddress) {
       }
     }
 
+    // Update last checked block so we don't scan them again
+    session.lastCheckedBlock = currentBlockNum;
     return { found: false };
   } catch (err) {
     console.error('[Check Deposit] Error:', err);
@@ -307,6 +399,10 @@ app.get('/session/:sessionId', (req, res) => {
     credits: session.credits,
     totalWon: session.totalWon,
     depositTxHash: session.depositTxHash,
+    wagerTier: session.wagerTier,
+    gameMode: session.gameMode,
+    requiredDeposit: session.requiredDeposit,
+    depositAddress: DEPOSIT_ADDRESS,
     createdAt: session.createdAt
   });
 });
@@ -342,7 +438,7 @@ app.post('/session/:sessionId/death', (req, res) => {
   });
 });
 
-// Step 5: Kill reward (send BNB to killer)
+// Step 5: Kill reward (send BESC to killer)
 app.post('/session/:sessionId/kill-reward', async (req, res) => {
   try {
     const { sessionId } = req.params;
@@ -392,12 +488,13 @@ app.post('/session/:sessionId/kill-reward', async (req, res) => {
     }
 
     const killerWallet = killerSession.walletAddress;
+    const payoutAmount = killerSession.payoutAmount || PAYOUT_AMOUNT;
 
-    console.log(`[Kill Reward] Sending ${PAYOUT_AMOUNT} BESC to ${killerWallet}`);
+    console.log(`[Kill Reward] Sending ${payoutAmount} BESC to ${killerWallet} (Tier: ${killerSession.wagerTier})`);
 
     // Check treasury balance
     const balanceWei = await web3.eth.getBalance(treasuryAccount.address);
-    const payoutWei = bescToWei(PAYOUT_AMOUNT);
+    const payoutWei = bescToWei(payoutAmount);
 
     if (BigInt(balanceWei) < BigInt(payoutWei)) {
       console.error('[Kill Reward] Insufficient treasury balance');
@@ -433,13 +530,13 @@ app.post('/session/:sessionId/kill-reward', async (req, res) => {
         console.log(`[Kill Reward] ⚠️  Transaction already in mempool or nonce too low (processed/pending), treating as success`);
  
         // Still update session and return success
-        killerSession.totalWon += PAYOUT_AMOUNT;
+        killerSession.totalWon += payoutAmount;
         killerSession.status = 'playing';
  
         return res.json({
           success: true,
           transactionHash: 'PENDING',
-          amount: PAYOUT_AMOUNT,
+          amount: payoutAmount,
           totalWon: killerSession.totalWon,
           note: 'Transaction already pending/processed'
         });
@@ -449,10 +546,10 @@ app.post('/session/:sessionId/kill-reward', async (req, res) => {
       throw txError;
     }
 
-    console.log(`[Kill Reward] ✅ Sent ${PAYOUT_AMOUNT} BESC - TX: ${receipt.transactionHash}`);
+    console.log(`[Kill Reward] ✅ Sent ${payoutAmount} BESC - TX: ${receipt.transactionHash}`);
 
     // Update session
-    killerSession.totalWon += PAYOUT_AMOUNT;
+    killerSession.totalWon += payoutAmount;
     killerSession.status = 'playing';
 
     // Record payment
@@ -460,7 +557,7 @@ app.post('/session/:sessionId/kill-reward', async (req, res) => {
       killer: killerWallet,
       killerSessionId: sessionId,
       victimSessionId: victimSessionId || 'unknown',
-      amount: PAYOUT_AMOUNT,
+      amount: payoutAmount,
       transactionHash: receipt.transactionHash,
       timestamp: Date.now(),
     };
@@ -469,7 +566,7 @@ app.post('/session/:sessionId/kill-reward', async (req, res) => {
     res.json({
       success: true,
       transactionHash: receipt.transactionHash,
-      amount: PAYOUT_AMOUNT,
+      amount: payoutAmount,
       totalWon: killerSession.totalWon
     });
   } catch (err) {
