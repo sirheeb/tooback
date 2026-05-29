@@ -1,11 +1,37 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const mongoose = require('mongoose');
 const { Web3 } = require('web3');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// MongoDB Connection
+const MONGODB_URI = process.env.MONGODB_URI;
+if (MONGODB_URI) {
+  mongoose.connect(MONGODB_URI)
+    .then(() => console.log('[MongoDB] Connected successfully to database'))
+    .catch(err => console.error('[MongoDB] Connection error:', err.message));
+} else {
+  console.warn('[MongoDB] MONGODB_URI is not set in .env. Profile persistence is disabled.');
+}
+
+// Profile Schema
+const profileSchema = new mongoose.Schema({
+  walletAddress: { type: String, required: true, unique: true, lowercase: true, trim: true },
+  username: { type: String, required: true, trim: true },
+  hasDeposited: { type: Boolean, default: false },
+  lastSeen: { type: Date, default: Date.now }
+});
+
+profileSchema.pre('save', function(next) {
+  this.lastSeen = Date.now();
+  next();
+});
+
+const Profile = mongoose.model('Profile', profileSchema);
 
 // Middleware
 app.use(cors());
@@ -140,6 +166,59 @@ app.get('/balance', async (req, res) => {
 });
 
 // ============================================================================
+// PROFILE MANAGEMENT ENDPOINTS
+// ============================================================================
+
+// Get all saved profiles (Dossiers selection grid)
+app.get('/profiles', async (req, res) => {
+  try {
+    let profiles = [];
+    if (MONGODB_URI) {
+      profiles = await Profile.find({}).sort({ lastSeen: -1 }).limit(30);
+    }
+    res.json(profiles);
+  } catch (err) {
+    console.error('[Profiles Fetch] Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Create or update a profile
+app.post('/profile', async (req, res) => {
+  try {
+    const { walletAddress, username } = req.body;
+    if (!walletAddress || !username) {
+      return res.status(400).json({ error: 'walletAddress and username are required' });
+    }
+    if (!web3.utils.isAddress(walletAddress)) {
+      return res.status(400).json({ error: 'Invalid BESC wallet address format' });
+    }
+
+    const normalizedAddress = walletAddress.toLowerCase();
+    
+    let profile = null;
+    if (MONGODB_URI) {
+      profile = await Profile.findOneAndUpdate(
+        { walletAddress: normalizedAddress },
+        { username: username },
+        { upsert: true, new: true }
+      );
+      console.log(`[Profile] Saved: ${normalizedAddress} -> ${username}`);
+    } else {
+      console.log(`[Profile] DB Offline. Simulated save: ${normalizedAddress} -> ${username}`);
+    }
+
+    res.json({
+      success: true,
+      profile: profile || { walletAddress: normalizedAddress, username, hasDeposited: false }
+    });
+  } catch (err) {
+    console.error('[Profile Save] Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================================
 // DEPOSIT-BASED ACCESS SYSTEM
 // ============================================================================
 
@@ -249,6 +328,35 @@ app.post('/request-access', async (req, res) => {
 
     sessions.set(sessionId, session);
 
+    // Ensure profile document exists in MongoDB
+    if (MONGODB_URI) {
+      try {
+        let profile = await Profile.findOne({ walletAddress: normalizedAddress });
+        if (!profile) {
+          profile = new Profile({
+            walletAddress: normalizedAddress,
+            username: `Player_${normalizedAddress.substring(2, 6)}`,
+            hasDeposited: whitelisted
+          });
+          await profile.save();
+          console.log(`[Profile] Created default profile for new wallet: ${normalizedAddress}`);
+        } else {
+          let updated = false;
+          if (whitelisted && !profile.hasDeposited) {
+            profile.hasDeposited = true;
+            updated = true;
+          }
+          profile.lastSeen = Date.now();
+          await profile.save();
+          if (updated) {
+            console.log(`[Profile] Marked whitelisted wallet as deposited in DB: ${normalizedAddress}`);
+          }
+        }
+      } catch (dbErr) {
+        console.error('[Session] Database error during profile check:', dbErr.message);
+      }
+    }
+
     if (whitelisted) {
       console.log(`[Session] ✅ Created WHITELISTED session ${sessionId} for ${normalizedAddress} (Tier: ${tier}, Mode: ${mode})`);
     } else {
@@ -310,6 +418,15 @@ app.get('/check-access/:sessionId', async (req, res) => {
         session.credits = Math.max(1, credits); // At least 1 credit
         session.totalDeposited = amountBesc;
         session.depositTxHash = depositFound.txHash;
+
+        // Mark profile as deposited in MongoDB
+        if (MONGODB_URI) {
+          Profile.findOneAndUpdate(
+            { walletAddress: session.walletAddress },
+            { hasDeposited: true, lastSeen: Date.now() },
+            { upsert: true }
+          ).catch(dbErr => console.error('[Deposit] DB update failed for profile:', dbErr.message));
+        }
 
         console.log(`[Deposit] ✅ Confirmed for ${session.walletAddress} - TX: ${depositFound.txHash} (Amount: ${amountBesc} BESC, Credits: ${session.credits})`);
 
