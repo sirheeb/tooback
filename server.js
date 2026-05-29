@@ -234,6 +234,7 @@ app.post('/request-access', async (req, res) => {
       walletAddress: normalizedAddress,
       status: whitelisted ? 'confirmed' : 'pending',
       credits: whitelisted ? 1 : 0,
+      totalDeposited: whitelisted ? requiredDeposit : 0,
       depositTxHash: whitelisted ? 'WHITELISTED' : null,
       totalWon: 0,
       wagerTier: tier,
@@ -286,6 +287,8 @@ app.get('/check-access/:sessionId', async (req, res) => {
       return res.json({
         status: session.status,
         credits: session.credits,
+        totalDeposited: session.totalDeposited || 0,
+        remainingBalance: parseFloat((session.credits * session.requiredDeposit).toFixed(4)),
         walletAddress: session.walletAddress,
         depositTxHash: session.depositTxHash,
         wagerTier: session.wagerTier,
@@ -298,16 +301,23 @@ app.get('/check-access/:sessionId', async (req, res) => {
       const depositFound = await checkForDeposit(session);
 
       if (depositFound.found) {
+        // Calculate credits based on amount deposited
+        const amountBesc = depositFound.amount;
+        const credits = Math.floor(amountBesc / session.requiredDeposit);
+
         // Update session
         session.status = 'confirmed';
-        session.credits = 1;
+        session.credits = Math.max(1, credits); // At least 1 credit
+        session.totalDeposited = amountBesc;
         session.depositTxHash = depositFound.txHash;
 
-        console.log(`[Deposit] ✅ Confirmed for ${session.walletAddress} - TX: ${depositFound.txHash} (Amount: ${depositFound.amount} BESC)`);
+        console.log(`[Deposit] ✅ Confirmed for ${session.walletAddress} - TX: ${depositFound.txHash} (Amount: ${amountBesc} BESC, Credits: ${session.credits})`);
 
         return res.json({
           status: 'confirmed',
-          credits: 1,
+          credits: session.credits,
+          totalDeposited: session.totalDeposited,
+          remainingBalance: parseFloat((session.credits * session.requiredDeposit).toFixed(4)),
           walletAddress: session.walletAddress,
           depositTxHash: depositFound.txHash,
           wagerTier: session.wagerTier,
@@ -402,6 +412,8 @@ app.get('/session/:sessionId', (req, res) => {
     wagerTier: session.wagerTier,
     gameMode: session.gameMode,
     requiredDeposit: session.requiredDeposit,
+    totalDeposited: session.totalDeposited || 0,
+    remainingBalance: parseFloat((session.credits * session.requiredDeposit).toFixed(4)),
     depositAddress: DEPOSIT_ADDRESS,
     createdAt: session.createdAt
   });
